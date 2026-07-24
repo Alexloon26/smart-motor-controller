@@ -1,0 +1,6 @@
+../Core/Src/main.c:96:7:PID_Compute	32	static
+../Core/Src/main.c:279:6:SystemClock_Config	96	static,ignoring_inline_asm
+../Core/Src/main.c:118:5:main	152	static,ignoring_inline_asm
+../Core/Src/main.c:554:6:HAL_GPIO_EXTI_Callback	48	static
+../Core/Src/main.c:567:6:HAL_UART_RxCpltCallback	4	static
+../Core/Src/main.c:591:6:Error_Handler	0	static,ignoring_inline_asm
