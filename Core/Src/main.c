@@ -53,15 +53,14 @@ TIM_HandleTypeDef htim3;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
+
 uint8_t rx_buffer[10];
 uint8_t rx_data;
 uint8_t rx_index = 0;
-uint8_t command_ready = 0;
-uint8_t estop_active = 0;
 uint32_t adc_value = 0;
+uint8_t command_ready=0;
 float motor_current = 0.0f;
 const float CURRENT_TRESHOLD = 3.5f;
-uint8_t overload_active = 0;
 int16_t encoder_count = 0;
 int16_t encoder_last_count = 0;
 int16_t speed_rpm = 0;
@@ -80,6 +79,14 @@ typedef struct{
 
 float target_speed_rpm;
 int8_t motor_direction = 0;
+
+typedef enum{
+	Waiting_command_State,
+	EStop_State,
+	Motor_Overload_State,
+	Motor_logic_Handling_State,
+}SystemState_t;
+SystemState_t current_state = Waiting_command_State;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -195,9 +202,9 @@ int main(void)
     }
     motor_current = (float)adc_value * 5.0f / 4095.0f;
 
-    if (motor_current > CURRENT_TRESHOLD && overload_active == 0)
+    if (motor_current > CURRENT_TRESHOLD && current_state != Motor_Overload_State)
     {
-      overload_active = 1;
+      current_state = Motor_Overload_State;
       HAL_GPIO_WritePin(MOTOR_IN1_GPIO_Port, MOTOR_IN1_Pin, GPIO_PIN_RESET);
       HAL_GPIO_WritePin(MOTOR_IN2_GPIO_Port, MOTOR_IN2_Pin, GPIO_PIN_RESET);
       __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 65535);
@@ -210,7 +217,7 @@ int main(void)
       encoder_last_count = encoder_count;
       speed_rpm = (delta * 10 * 60 / 96);
 
-      if(motor_direction!=0 && estop_active ==0 && overload_active==0){
+      if(current_state==Motor_logic_Handling_State){
         float current_speed_abs= (float)abs(speed_rpm);
         float current_pwm=PID_Compute(&motor1_pid, target_speed_rpm, current_speed_abs, 0.1);
         __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, (uint32_t)current_pwm);
@@ -223,24 +230,22 @@ int main(void)
       char tx_buffer[100];
       if (strncmp("RESET", (char*)rx_buffer, 5) == 0)
       {
-        estop_active = 0;
-        overload_active = 0;
+        current_state= Waiting_command_State;
         motor1_pid.integral_sum=0;
         strcpy(tx_buffer, "System has been reseted\r\n");
         HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
-      }
-      else if (estop_active == 1)
-      {
-        strcpy(tx_buffer, "Error, E-Stop\r\n");
-        HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
-      }
-      else if (overload_active)
-      {
+      }else{
+    	  switch(current_state){
+      case(Motor_Overload_State):
         strcpy(tx_buffer, "Error, Overload stop\r\n");
         HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
-      }
-      else
-      {
+        break;
+      case(EStop_State):
+          strcpy(tx_buffer, "Error, E-Stop\r\n");
+            HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
+            break;
+      case(Waiting_command_State):
+      case(Motor_logic_Handling_State):
         if (strncmp((char*)rx_buffer, "STOP", 4) == 0)
         {
           motor_direction=0;
@@ -253,7 +258,9 @@ int main(void)
           HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
         }
         else if (rx_buffer[0] == 'F')
-        {if(rx_buffer[1]<='9' && rx_buffer[1]>='0'){
+        {
+            current_state= Motor_logic_Handling_State;
+        	if(rx_buffer[1]<='9' && rx_buffer[1]>='0'){
           int speed = atoi((char*)&rx_buffer[1]);
           if (speed > 999) speed = 999;
 
@@ -279,9 +286,12 @@ int main(void)
             snprintf(tx_buffer, sizeof(tx_buffer), "Unknown command\r\n");
             HAL_UART_Transmit(&huart1, (uint8_t*) tx_buffer, strlen(tx_buffer),100);
         }
-        }
+    	  }
         else if (rx_buffer[0] == 'R')
-        {if(rx_buffer[1]<='9' && rx_buffer[1]>='0'){
+        {
+
+            current_state= Motor_logic_Handling_State;
+            if(rx_buffer[1]<='9' && rx_buffer[1]>='0'){
           int speed = atoi((char*)&rx_buffer[1]);
           if (speed > 999) speed = 999;
           if (speed == 0) {
@@ -314,7 +324,9 @@ int main(void)
             snprintf(tx_buffer, sizeof(tx_buffer), "Unknown command\r\n");
             HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
         }
-      }
+      break;
+        }
+    	  }
       memset(rx_buffer, 0, sizeof(rx_buffer));
     }
   }
@@ -636,7 +648,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     HAL_GPIO_WritePin(MOTOR_IN1_GPIO_Port, MOTOR_IN1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(MOTOR_IN2_GPIO_Port, MOTOR_IN2_Pin, GPIO_PIN_RESET);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 65535);
-    estop_active = 1;
+    current_state = EStop_State;
     char msg[] = "\r\n!!! EMERGENCY STOP !!!\r\n";
     HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
   }
