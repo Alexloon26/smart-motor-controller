@@ -51,14 +51,14 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 
 UART_HandleTypeDef huart1;
+DMA_HandleTypeDef hdma_usart1_rx;
 
 /* USER CODE BEGIN PV */
 
-uint8_t rx_buffer[10];
-uint8_t rx_data;
-uint8_t rx_index = 0;
+uint8_t rx_buffer[32];
+volatile uint16_t command_length=0;
 uint32_t adc_value = 0;
-uint8_t command_ready=0;
+volatile uint8_t command_ready=0;
 float motor_current = 0.0f;
 const float CURRENT_TRESHOLD = 3.5f;
 int16_t encoder_count = 0;
@@ -163,7 +163,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(MOTOR_IN1_GPIO_Port, MOTOR_IN1_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(MOTOR_IN2_GPIO_Port, MOTOR_IN2_Pin, GPIO_PIN_RESET);
-  HAL_UART_Receive_IT(&huart1, &rx_data, 1);
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_buffer, sizeof(rx_buffer));
+  __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
   if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
@@ -596,6 +597,9 @@ static void MX_DMA_Init(void)
   /* DMA1_Channel1_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel5_IRQn);
 
 }
 
@@ -653,35 +657,19 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
   }
 }
-
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    if (rx_data == '\n' || rx_data == '\r')
-    {
-      rx_buffer[rx_index] = '\0';
-      command_ready = 1;
-      rx_index = 0;
-    }
-    else
-    {
-      rx_buffer[rx_index++] = rx_data;
-      if (rx_index >= 10) rx_index = 0;
-    }
-    HAL_UART_Receive_IT(&huart1, &rx_data, 1);
-  }
-}
-
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
-{
-  if (huart->Instance == USART1)
-  {
-    __HAL_UART_CLEAR_OREFLAG(huart);
-    __HAL_UART_CLEAR_NEFLAG(huart);
-    __HAL_UART_CLEAR_FEFLAG(huart);
-    HAL_UART_Receive_IT(&huart1, &rx_data, 1);
-  }
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
+	if(huart->Instance == USART1){
+		command_length = Size;
+		for(int i = 0; i<Size; i++){
+			if(rx_buffer[i]=='\r'|| rx_buffer[i] == '\n'){
+				rx_buffer[i]='\0';
+				break;
+			}
+		}
+		command_ready = 1;
+		HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_buffer, sizeof(rx_buffer));
+		__HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+	}
 }
 /* USER CODE END 4 */
 
