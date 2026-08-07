@@ -85,11 +85,27 @@ int8_t motor_direction = 0;
 
 typedef enum{
 	Waiting_command_State,
-	EStop_State,
-	Motor_Overload_State,
+	Fault_State,
 	Motor_logic_Handling_State,
 }SystemState_t;
 SystemState_t current_state = Waiting_command_State;
+typedef enum {
+	FAULT_NONE = 0x00,
+	FAULT_ESTOP = 0x01,
+	FAULT_OVERCURRENT = 0x02,
+	FAULT_TIMEOUT = 0x03
+} FaultCode_t;
+volatile uint32_t system_faults = FAULT_NONE;
+volatile uint32_t last_comm_time = 0;
+const uint32_t COMM_TIMEOUT_MS = 500;
+typedef struct{
+uint32_t timestamp;
+int16_t current_rpm;
+int16_t target_rpm;
+float current_amps;
+uint32_t active_faults;
+}TelemetryPacket_t;
+TelemetryPacket_t telemetry_data;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -554,13 +570,15 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     HAL_GPIO_WritePin(MOTOR_IN1_GPIO_Port, MOTOR_IN1_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(MOTOR_IN2_GPIO_Port, MOTOR_IN2_Pin, GPIO_PIN_RESET);
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 65535);
-    current_state = EStop_State;
+    current_state = Fault_State;
+    system_faults |= FAULT_ESTOP;
     char msg[] = "\r\n!!! EMERGENCY STOP !!!\r\n";
     HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
   }
 }
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
 	if(huart->Instance == USART1){
+		last_comm_time = HAL_GetTick();
 		command_length = Size;
 		for(int i = 0; i<Size; i++){
 			if(rx_buffer[i]=='\r'|| rx_buffer[i] == '\n'){
@@ -595,17 +613,14 @@ void StartDefaultTask(void const * argument)
 	  if (strncmp("RESET", (char*)rx_buffer, 5) == 0)
 	        {
 	          current_state= Waiting_command_State;
+	          system_faults = FAULT_NONE;
 	          motor1_pid.integral_sum=0;
-	          strcpy(tx_buffer, "System has been reseted\r\n");
+	          strcpy(tx_buffer, "System faults cleared. Ready\r\n");
 	          HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
 	        }else{
 	      	  switch(current_state){
-	        case(Motor_Overload_State):
-	          strcpy(tx_buffer, "Error, Overload stop\r\n");
-	          HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
-	          break;
-	        case(EStop_State):
-	            strcpy(tx_buffer, "Error, E-Stop\r\n");
+	      	  case Fault_State:
+	      		snprintf(tx_buffer, sizeof(tx_buffer), "Error! Active Faults: 0x%02lX. Send RESET.\r\n", system_faults);
 	              HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
 	              break;
 	        case(Waiting_command_State):
@@ -709,6 +724,7 @@ void StartTask02(void const * argument)
   TickType_t xLastWakeTime;
   const TickType_t xFrequency = pdMS_TO_TICKS(100);
   xLastWakeTime = xTaskGetTickCount();
+  char tele_buffer[128];
   for(;;)
   {
     HAL_IWDG_Refresh(&hiwdg);
@@ -717,28 +733,45 @@ void StartTask02(void const * argument)
         {
           adc_value = HAL_ADC_GetValue(&hadc1);
         }
-        motor_current = (float)adc_value * 5.0f / 4095.0f;
-
-        if (motor_current > CURRENT_TRESHOLD && current_state != Motor_Overload_State)
+        motor_current = (float)adc_value * 5.0f / 4095;
+        if(motor_current > CURRENT_TRESHOLD){
+        	system_faults |= FAULT_OVERCURRENT;
+        }
+        last_time = HAL_GetTick();
+                 encoder_count = __HAL_TIM_GET_COUNTER(&htim3);
+                 int16_t delta = encoder_count - encoder_last_count;
+                 encoder_last_count = encoder_count;
+                 speed_rpm = (delta * 10 * 60 / 96);
+        if((last_comm_time != 0) && (HAL_GetTick() - last_comm_time > COMM_TIMEOUT_MS)){
+        	system_faults |= FAULT_TIMEOUT;
+        }
+        if (system_faults != FAULT_NONE)
         {
-          current_state = Motor_Overload_State;
+
+          current_state = Fault_State;
+          motor_direction=0;
+          target_speed_rpm=0;
           HAL_GPIO_WritePin(MOTOR_IN1_GPIO_Port, MOTOR_IN1_Pin, GPIO_PIN_RESET);
           HAL_GPIO_WritePin(MOTOR_IN2_GPIO_Port, MOTOR_IN2_Pin, GPIO_PIN_RESET);
           __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 65535);
-          char msg[] = "\r\n!!! MOTOR OVERLOAD !!!\r\n";
-          HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
-        }
-          last_time = HAL_GetTick();
-          encoder_count = __HAL_TIM_GET_COUNTER(&htim3);
-          int16_t delta = encoder_count - encoder_last_count;
-          encoder_last_count = encoder_count;
-          speed_rpm = (delta * 10 * 60 / 96);
-
-          if(current_state==Motor_logic_Handling_State){
-            float current_speed_abs= (float)abs(speed_rpm);
-            float current_pwm=PID_Compute(&motor1_pid, target_speed_rpm, current_speed_abs, 0.1);
-            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, (uint32_t)current_pwm);
+        }else if(current_state == Motor_logic_Handling_State){
+        	 float current_speed_abs= (float)abs(speed_rpm);
+        	            float current_pwm=PID_Compute(&motor1_pid, target_speed_rpm, current_speed_abs, 0.1);
+        	            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, (uint32_t)current_pwm);
           }
+
+          telemetry_data.timestamp = HAL_GetTick();
+          telemetry_data.current_rpm = speed_rpm;
+          telemetry_data.target_rpm = (int16_t)target_speed_rpm;
+          telemetry_data.current_amps = motor_current;
+          telemetry_data.active_faults = system_faults;
+          int amps_int = (int)telemetry_data.current_amps;
+          int amps_frac = (int)((telemetry_data.current_amps - amps_int) * 100);
+          snprintf(tele_buffer, sizeof(tele_buffer), "[TELEMETRY] T:%lu RPM:%d TGT:%d I:%d.%02dA FAULTS:0x%02lX\r\n",
+                   telemetry_data.timestamp, telemetry_data.current_rpm,
+                   telemetry_data.target_rpm, amps_int, amps_frac,
+                   telemetry_data.active_faults);
+          HAL_UART_Transmit(&huart1, (uint8_t*)tele_buffer, strlen(tele_buffer), 10);
           vTaskDelayUntil(&xLastWakeTime, xFrequency);
   }
   /* USER CODE END StartTask02 */
