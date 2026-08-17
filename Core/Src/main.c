@@ -34,7 +34,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+//#define COMM_MODE_UART
+#define COMM_MODE_CAN
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -45,6 +46,8 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 DMA_HandleTypeDef hdma_adc1;
+
+CAN_HandleTypeDef hcan;
 
 IWDG_HandleTypeDef hiwdg;
 
@@ -57,7 +60,15 @@ DMA_HandleTypeDef hdma_usart1_rx;
 osThreadId MotorTaskHandle;
 osThreadId ControlTaskHandle;
 /* USER CODE BEGIN PV */
-
+#ifdef COMM_MODE_CAN
+CAN_TxHeaderTypeDef TxHeader;
+CAN_RxHeaderTypeDef RxHeader;
+uint8_t TxData[8];
+uint8_t RxData[8];
+uint32_t TxMailbox;
+const uint32_t CAN_ID_COMMANDS = 0x010;
+const uint32_t CAN_ID_TELEMETRY = 0x020;
+#endif
 uint8_t rx_buffer[32];
 volatile uint16_t command_length=0;
 uint32_t adc_value = 0;
@@ -93,10 +104,12 @@ typedef enum {
 	FAULT_NONE = 0x00,
 	FAULT_ESTOP = 0x01,
 	FAULT_OVERCURRENT = 0x02,
-	FAULT_TIMEOUT = 0x03
+	FAULT_TIMEOUT = 0x04,
+	FAULT_STALL = 0x08
 } FaultCode_t;
 volatile uint32_t system_faults = FAULT_NONE;
 volatile uint32_t last_comm_time = 0;
+volatile uint8_t stall_counter = 0;
 const uint32_t COMM_TIMEOUT_MS = 500;
 typedef struct{
 uint32_t timestamp;
@@ -117,6 +130,7 @@ static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_IWDG_Init(void);
+static void MX_CAN_Init(void);
 void StartDefaultTask(void const * argument);
 void StartTask02(void const * argument);
 
@@ -182,11 +196,42 @@ int main(void)
   MX_ADC1_Init();
   MX_TIM2_Init();
   MX_IWDG_Init();
+  MX_CAN_Init();
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(MOTOR_IN1_GPIO_Port, MOTOR_IN1_Pin, GPIO_PIN_RESET);
   HAL_GPIO_WritePin(MOTOR_IN2_GPIO_Port, MOTOR_IN2_Pin, GPIO_PIN_RESET);
+#ifdef COMM_MODE_UART
   HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_buffer, sizeof(rx_buffer));
   __HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
+  char boot_msg[]="\r\n--- SYSTEM BOOT / RESET ---\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t *)boot_msg, strlen(boot_msg), 100);
+#endif
+#ifdef COMM_MODE_CAN
+    CAN_FilterTypeDef canfilterconfig;
+    canfilterconfig.FilterActivation = CAN_FILTER_ENABLE;
+    canfilterconfig.FilterBank = 0;
+    canfilterconfig.FilterFIFOAssignment = CAN_RX_FIFO0;
+    canfilterconfig.FilterIdHigh = (CAN_ID_COMMANDS<<5);
+    canfilterconfig.FilterIdLow = 0x000;
+    canfilterconfig.FilterMaskIdHigh = (0x7FF << 5);
+    canfilterconfig.FilterMaskIdLow = 0x0000;
+    canfilterconfig.FilterMode = CAN_FILTERMODE_IDMASK;
+    canfilterconfig.FilterScale = CAN_FILTERSCALE_32BIT;
+    canfilterconfig.SlaveStartFilterBank =14;
+    if (HAL_CAN_ConfigFilter(&hcan, &canfilterconfig) != HAL_OK){
+    	Error_Handler();
+    }
+    if(HAL_CAN_Start(&hcan) != HAL_OK){
+    	Error_Handler();
+    }
+    if(HAL_CAN_ActivateNotification(&hcan, CAN_IT_RX_FIFO0_MSG_PENDING)){
+    	Error_Handler();
+    }
+    TxHeader.StdId = CAN_ID_TELEMETRY;
+    TxHeader.ExtId = 0;
+    TxHeader.IDE = CAN_ID_STD;
+    TxHeader.DLC = 8;
+#endif
   if (HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3) != HAL_OK)
   {
     Error_Handler();
@@ -203,8 +248,7 @@ int main(void)
   motor1_pid.prev_error=0;
   motor1_pid.out_max=65535;
   motor1_pid.out_min=0;
-  char boot_msg[]="\r\n--- SYSTEM BOOT / RESET ---\r\n";
-  HAL_UART_Transmit(&huart1, (uint8_t *)boot_msg, strlen(boot_msg), 100);
+
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN RTOS_MUTEX */
@@ -340,6 +384,43 @@ static void MX_ADC1_Init(void)
   /* USER CODE BEGIN ADC1_Init 2 */
 
   /* USER CODE END ADC1_Init 2 */
+
+}
+
+/**
+  * @brief CAN Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_CAN_Init(void)
+{
+
+  /* USER CODE BEGIN CAN_Init 0 */
+
+  /* USER CODE END CAN_Init 0 */
+
+  /* USER CODE BEGIN CAN_Init 1 */
+
+  /* USER CODE END CAN_Init 1 */
+  hcan.Instance = CAN1;
+  hcan.Init.Prescaler = 1;
+  hcan.Init.Mode = CAN_MODE_NORMAL;
+  hcan.Init.SyncJumpWidth = CAN_SJW_1TQ;
+  hcan.Init.TimeSeg1 = CAN_BS1_13TQ;
+  hcan.Init.TimeSeg2 = CAN_BS2_2TQ;
+  hcan.Init.TimeTriggeredMode = DISABLE;
+  hcan.Init.AutoBusOff = DISABLE;
+  hcan.Init.AutoWakeUp = DISABLE;
+  hcan.Init.AutoRetransmission = DISABLE;
+  hcan.Init.ReceiveFifoLocked = DISABLE;
+  hcan.Init.TransmitFifoPriority = DISABLE;
+  if (HAL_CAN_Init(&hcan) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN CAN_Init 2 */
+
+  /* USER CODE END CAN_Init 2 */
 
 }
 
@@ -576,6 +657,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 100);
   }
 }
+#ifdef COMM_MODE_UART
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
 	if(huart->Instance == USART1){
 		last_comm_time = HAL_GetTick();
@@ -593,6 +675,22 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
 		__HAL_DMA_DISABLE_IT(huart1.hdmarx, DMA_IT_HT);
 	}
 }
+#endif
+#ifdef COMM_MODE_CAN
+void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
+{
+if(HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, RxData) == HAL_OK){
+if(RxHeader.StdId == CAN_ID_COMMANDS){
+	last_comm_time = HAL_GetTick();
+	memcpy((char*)rx_buffer, RxData, RxHeader.DLC);
+	rx_buffer[RxHeader.DLC] = '\0';
+	BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+	vTaskNotifyGiveFromISR(MotorTaskHandle, &xHigherPriorityTaskWoken);
+	portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+}
+}
+#endif
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -615,6 +713,8 @@ void StartDefaultTask(void const * argument)
 	          current_state= Waiting_command_State;
 	          system_faults = FAULT_NONE;
 	          motor1_pid.integral_sum=0;
+	          stall_counter = 0;
+	          last_comm_time = HAL_GetTick();
 	          strcpy(tx_buffer, "System faults cleared. Ready\r\n");
 	          HAL_UART_Transmit(&huart1, (uint8_t*)tx_buffer, strlen(tx_buffer), 100);
 	        }else{
@@ -758,13 +858,23 @@ void StartTask02(void const * argument)
         	 float current_speed_abs= (float)abs(speed_rpm);
         	            float current_pwm=PID_Compute(&motor1_pid, target_speed_rpm, current_speed_abs, 0.1);
         	            __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, (uint32_t)current_pwm);
-          }
+        	            if(target_speed_rpm !=0 && current_speed_abs<10){
+        	            stall_counter++;
+        	            if (stall_counter>=10){
+        	            	system_faults |= FAULT_STALL;
+        	            }
+        	            }else{
+        	            	stall_counter =0;
+        	            }
+        }
+
 
           telemetry_data.timestamp = HAL_GetTick();
           telemetry_data.current_rpm = speed_rpm;
           telemetry_data.target_rpm = (int16_t)target_speed_rpm;
           telemetry_data.current_amps = motor_current;
           telemetry_data.active_faults = system_faults;
+#ifdef COMM_MODE_UART
           int amps_int = (int)telemetry_data.current_amps;
           int amps_frac = (int)((telemetry_data.current_amps - amps_int) * 100);
           snprintf(tele_buffer, sizeof(tele_buffer), "[TELEMETRY] T:%lu RPM:%d TGT:%d I:%d.%02dA FAULTS:0x%02lX\r\n",
@@ -772,8 +882,18 @@ void StartTask02(void const * argument)
                    telemetry_data.target_rpm, amps_int, amps_frac,
                    telemetry_data.active_faults);
           HAL_UART_Transmit(&huart1, (uint8_t*)tele_buffer, strlen(tele_buffer), 10);
+#endif
           vTaskDelayUntil(&xLastWakeTime, xFrequency);
-  }
+#ifdef COMM_MODE_CAN
+          TxData[0]= (uint8_t)(telemetry_data.current_rpm >> 8);
+          TxData[1] = (uint8_t)(telemetry_data.current_rpm & 0xFF);
+          TxData[2] = (uint8_t)(telemetry_data.target_rpm >> 8);
+          TxData[3] = (uint8_t)(telemetry_data.target_rpm & 0xFF);
+          TxData[4] = (uint8_t)(telemetry_data.current_amps * 10.0f);
+          TxData[5] = (uint8_t)(telemetry_data.active_faults);
+          HAL_CAN_AddTxMessage(&hcan, &TxHeader, TxData, &TxMailbox);
+#endif
+}
   /* USER CODE END StartTask02 */
 }
 
